@@ -4,12 +4,15 @@ import os
 import pandas as pd
 import re
 import json
+import sqlite3
+from datetime import datetime, timedelta
+import io
 
 app = Flask(__name__)
 
-# File paths
-RAW_CSV_FILE = 'raw_scanned_data.csv'
-PROCESSED_CSV_FILE = 'processed_crew_data.csv'
+# Database file path
+DATABASE_FILE = 'crew_data.db'
+RAW_CSV_FILE = 'raw_scanned_data.csv'  # Keep for temporary data collection
 
 # Temporary storage to accumulate scanned fields
 scanned_data = {}
@@ -18,7 +21,30 @@ expected_fields = [
     'TT No', 'DL No', 'DL Expiry Date'
 ]
 
-# Initialize CSV file
+# Initialize database
+def init_database():
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    # Create table if it doesn't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS crew_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        crew_id TEXT,
+        name TEXT,
+        crew_type TEXT,
+        pass_valid_upto TEXT,
+        tt_no TEXT,
+        dl_no TEXT,
+        dl_expiry_date TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize CSV file for temporary storage
 def init_raw_csv():
     if not os.path.exists(RAW_CSV_FILE):
         open(RAW_CSV_FILE, 'w').close()
@@ -33,13 +59,26 @@ def reset_raw_csv():
         writer = csv.DictWriter(file, fieldnames=expected_fields)
         writer.writeheader()
 
-# Reset processed CSV file (empty it)
-def reset_processed_csv():
-    if os.path.exists(PROCESSED_CSV_FILE):
-        open(PROCESSED_CSV_FILE, 'w').close()
-        with open(PROCESSED_CSV_FILE, 'w', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=expected_fields)
-            writer.writeheader()
+# Add data to database
+def add_to_database(data):
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT INTO crew_data (crew_id, name, crew_type, pass_valid_upto, tt_no, dl_no, dl_expiry_date)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        data.get('Crew Id', ''),
+        data.get('Name', ''),
+        data.get('Crew Type', ''),
+        data.get('pass valid Upto', ''),
+        data.get('TT No', ''),
+        data.get('DL No', ''),
+        data.get('DL Expiry Date', '')
+    ))
+    
+    conn.commit()
+    conn.close()
 
 # Improved /receive_data route for accumulating data
 @app.route('/receive_data', methods=['POST'])
@@ -65,13 +104,17 @@ def receive_data():
             if field in expected_fields:
                 scanned_data[field] = value
 
-            # Write to CSV when all fields are captured
+            # Write to CSV and database when all fields are captured
             if len(scanned_data) == len(expected_fields):
+                # Add to temporary CSV file
                 with open(RAW_CSV_FILE, 'a', newline='') as file:
                     writer = csv.DictWriter(file, fieldnames=expected_fields)
                     if file.tell() == 0:  # Add header if file is empty
                         writer.writeheader()
                     writer.writerow(scanned_data)
+                
+                # Add to database for permanent storage
+                add_to_database(scanned_data)
 
                 # Clear accumulated data for the next entry
                 scanned_data.clear()
@@ -80,7 +123,7 @@ def receive_data():
 
         return jsonify({'status': 'partial', 'message': 'डेटा प्राप्त हुआ, अधिक फ़ील्ड की प्रतीक्षा'})
 
-# Process raw data into structured CSV
+# Process raw data into database
 def process_raw_data():
     if not os.path.exists(RAW_CSV_FILE):
         return False
@@ -94,16 +137,28 @@ def process_raw_data():
 
         # Read the raw data
         df = pd.read_csv(RAW_CSV_FILE)
+        
+        # Add each row to the database
+        conn = sqlite3.connect(DATABASE_FILE)
+        for _, row in df.iterrows():
+            data = row.to_dict()
+            cursor = conn.cursor()
+            cursor.execute('''
+            INSERT INTO crew_data (crew_id, name, crew_type, pass_valid_upto, tt_no, dl_no, dl_expiry_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                data.get('Crew Id', ''),
+                data.get('Name', ''),
+                data.get('Crew Type', ''),
+                data.get('pass valid Upto', ''),
+                data.get('TT No', ''),
+                data.get('DL No', ''),
+                data.get('DL Expiry Date', '')
+            ))
+        conn.commit()
+        conn.close()
 
-        # If processed file exists, append without duplicating headers
-        if os.path.exists(PROCESSED_CSV_FILE) and os.path.getsize(PROCESSED_CSV_FILE) > 0:
-            existing_df = pd.read_csv(PROCESSED_CSV_FILE)
-            combined_df = pd.concat([existing_df, df], ignore_index=True)
-            combined_df.to_csv(PROCESSED_CSV_FILE, index=False)
-        else:
-            df.to_csv(PROCESSED_CSV_FILE, index=False)
-
-        # ✅ Clear the `RAW_CSV_FILE` only after successful processing
+        # Clear the `RAW_CSV_FILE` only after successful processing
         reset_raw_csv()
 
         return True
@@ -125,41 +180,90 @@ def process_data():
     else:
         return jsonify({'status': 'error', 'message': 'प्रोसेस करने के लिए कोई डेटा नहीं या प्रोसेसिंग त्रुटि'}), 400
 
-# Route to download the processed CSV
+# Route to download the data as CSV
 @app.route('/download')
 def download():
-    process_raw_data()
-    if os.path.exists(PROCESSED_CSV_FILE):
-        return send_file(PROCESSED_CSV_FILE, 
-                         mimetype='text/csv', 
-                         download_name='crew_data.csv', 
-                         as_attachment=True)
-    else:
-        return "डाउनलोड के लिए कोई डेटा उपलब्ध नहीं है", 404
+    try:
+        # Get data from database including only records from the last 30 days
+        conn = sqlite3.connect(DATABASE_FILE)
+        thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        query = '''
+        SELECT crew_id, name, crew_type, pass_valid_upto, tt_no, dl_no, dl_expiry_date
+        FROM crew_data
+        WHERE created_at >= ?
+        '''
+        
+        df = pd.read_sql_query(query, conn, params=(thirty_days_ago,))
+        conn.close()
+        
+        # Convert column names back to match expected fields
+        df.columns = ['Crew Id', 'Name', 'Crew Type', 'pass valid Upto', 'TT No', 'DL No', 'DL Expiry Date']
+        
+        # Create a CSV file in memory
+        csv_data = io.StringIO()
+        df.to_csv(csv_data, index=False)
+        csv_data.seek(0)
+        
+        # Send the CSV file as an attachment
+        return send_file(
+            io.BytesIO(csv_data.getvalue().encode('utf-8')),
+            mimetype='text/csv',
+            download_name='crew_data.csv',
+            as_attachment=True
+        )
+    except Exception as e:
+        return f"डाउनलोड के लिए डेटा तैयार करने में त्रुटि: {str(e)}", 500
 
-# Route to view processed data
+# Route to view data from database
 @app.route('/view_data')
 def view_data():
-    process_raw_data()
-
-    if not os.path.exists(PROCESSED_CSV_FILE):
-        return render_template('view_data.html', data=[])
-
     try:
-        df = pd.read_csv(PROCESSED_CSV_FILE)
+        conn = sqlite3.connect(DATABASE_FILE)
+        # Get data from the last 30 days
+        thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        query = '''
+        SELECT crew_id, name, crew_type, pass_valid_upto, tt_no, dl_no, dl_expiry_date
+        FROM crew_data
+        WHERE created_at >= ?
+        '''
+        
+        df = pd.read_sql_query(query, conn, params=(thirty_days_ago,))
+        conn.close()
+        
+        # Convert column names to match expected fields for display
+        df.columns = ['Crew Id', 'Name', 'Crew Type', 'pass valid Upto', 'TT No', 'DL No', 'DL Expiry Date']
+        
         data = [df.columns.tolist()] + df.values.tolist()
         return render_template('view_data.html', data=data)
     except Exception as e:
         return f"डेटा पढ़ने में त्रुटि: {str(e)}", 500
 
-# Debug route for raw data inspection
-@app.route('/debug_raw')
-def debug_raw():
-    if os.path.exists(RAW_CSV_FILE):
-        with open(RAW_CSV_FILE, 'r') as file:
-            raw_content = file.read()
-        return f"<pre>{raw_content}</pre>"
-    return "कोई कच्चा डेटा उपलब्ध नहीं है"
+# New route to reset all data older than 30 days
+@app.route('/cleanup_old_data', methods=['POST'])
+def cleanup_old_data():
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        # Delete records older than 30 days
+        thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute('DELETE FROM crew_data WHERE created_at < ?', (thirty_days_ago,))
+        
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'status': 'success', 
+            'message': f'{deleted_count} पुराने रिकॉर्ड हटा दिए गए हैं'
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error', 
+            'message': f'पुराने डेटा को हटाने में त्रुटि: {str(e)}'
+        }), 500
 
 # Route to manually reset raw data
 @app.route('/reset_raw')
@@ -167,22 +271,29 @@ def reset_raw():
     reset_raw_csv()
     return jsonify({'status': 'success', 'message': 'कच्चा डेटा रीसेट कर दिया गया है'})
 
-# New route to reset both CSV files
+# Reset all data in the database
 @app.route('/reset_data', methods=['POST'])
 def reset_data():
     try:
-        # Reset both raw and processed CSV files
+        # Reset raw CSV file
         reset_raw_csv()
-        reset_processed_csv()
         
-        # Also clear any accumulated data
+        # Clear accumulated data
         global scanned_data
         scanned_data = {}
+        
+        # Clear database
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM crew_data')
+        conn.commit()
+        conn.close()
         
         return jsonify({'status': 'success', 'message': 'सभी डेटा सफलतापूर्वक रीसेट कर दिया गया है'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': f'रीसेट करने में त्रुटि: {str(e)}'}), 500
 
 if __name__ == '__main__':
+    init_database()
     init_raw_csv()
     app.run(debug=True)
